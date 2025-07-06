@@ -16,13 +16,11 @@ import yt_dlp
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 
 load_dotenv()
 
@@ -50,10 +48,8 @@ def decrypt_token(encrypted_token, key):
         logger.error(f"Ошибка при дешифровании токена: {e}")
         raise
 
-
 ENCRYPTION_KEY = get_encryption_key()
 cipher = Fernet(ENCRYPTION_KEY)
-
 
 try:
     with open('encrypted_token.bin', 'rb') as token_file:
@@ -65,9 +61,7 @@ except FileNotFoundError:
         token_file.write(ENCRYPTED_TOKEN)
     logger.info("Зашифрованный токен сохранён в encrypted_token.bin")
 
-
 API_TOKEN = decrypt_token(ENCRYPTED_TOKEN, ENCRYPTION_KEY)
-
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_RESULTS = 20
@@ -80,10 +74,8 @@ CHANNEL_ID = int(os.getenv('CHANNEL_ID', '-1002715409948'))
 CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME', '@SoundPlus1')
 PAYMENT_CHANNEL_ID = int(os.getenv('PAYMENT_CHANNEL_ID', '-1002747322675'))
 
-
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
 dp = Dispatcher()
-
 
 conn = sqlite3.connect('music_bot_youtube.db')
 cursor = conn.cursor()
@@ -96,12 +88,21 @@ cursor.execute("""
         lang TEXT DEFAULT 'Русский',
         premium_until TEXT,
         downloads_today INTEGER DEFAULT 0,
+        total_downloads INTEGER DEFAULT 0,
         last_reset TEXT DEFAULT '',
-        action_count INTEGER DEFAULT 0,  -- Новое поле для подсчета действий
+        action_count INTEGER DEFAULT 0,
         is_new_user BOOLEAN DEFAULT TRUE,
         referrer_id INTEGER DEFAULT NULL
     )
 """)
+
+# Migrate existing database to add total_downloads column
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN total_downloads INTEGER DEFAULT 0")
+    conn.commit()
+    logger.info("Added total_downloads column to users table")
+except sqlite3.OperationalError:
+    logger.info("total_downloads column already exists")
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS payments (
@@ -196,8 +197,8 @@ def has_premium(uid):
 def can_download(uid):
     if has_premium(uid):
         return True
-    downloads = get_user_field(uid, 'downloads_today') or 0
-    return downloads < 2
+    total_downloads = get_user_field(uid, 'total_downloads') or 0
+    return total_downloads < 30  # Free users limited to 30 tracks
 
 def should_send_ad(uid):
     if has_premium(uid):
@@ -297,7 +298,7 @@ async def download_audio(video_id, title=None):
         'format': 'bestaudio',
         'outtmpl': f"temp/{filename}.%(ext)s",
         'quiet': True,
-        'nocheckcertificate': True,
+        'nocheckcertificate': true,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -408,7 +409,7 @@ async def get_bot_stats():
 
 def get_premium_price(days, is_new_user=False):
     base_price = PREMIUM_PRICES.get(str(days), 0)
-    if is_new_user and days == 30:  # Скидка только на 30 дней для новых пользователей
+    if is_new_user and days == 30:
         return int(base_price * (1 - NEW_USER_DISCOUNT))
     return base_price
 
@@ -450,7 +451,6 @@ def update_payment(payment_id, status, screenshot=None):
         )
     conn.commit()
 
-# --- Command Handlers ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if is_bot_disabled():
@@ -519,7 +519,9 @@ async def cmd_start(message: types.Message):
     if has_premium(uid):
         await message.answer("Привет! Премиум тариф активен 🎵", reply_markup=kb.as_markup())
     else:
+        total_downloads = get_user_field(uid, 'total_downloads') or 0
         discount_msg = "\n✨ Новым пользователям: первый месяц премиума со скидкой 20%!" if is_new_user else ""
+        welcome_message += f"\n📢 Бесплатный тариф: осталось {30 - total_downloads} треков из 30."
         await message.answer(
             f"Привет! Бесплатный тариф активирован 🎵{discount_msg}\n👉 Приглашай друзей и зарабатывай бонусы!",
             reply_markup=kb.as_markup())
@@ -1326,7 +1328,8 @@ async def cb_play(callback: types.CallbackQuery):
     increment_action_count(uid)
     if not can_download(uid):
         await callback.message.answer(
-            "❌ Превышен лимит загрузок для бесплатного тарифа. Купите премиум для неограниченного доступа!")
+            "❌ Вы достигли лимита в 30 треков для бесплатного тарифа. Купите премиум для неограниченного доступа!"
+        )
         return
     try:
         ydl_opts = {'quiet': True, 'nocheckcertificate': True}
@@ -1349,7 +1352,8 @@ async def cb_play(callback: types.CallbackQuery):
             'duration': duration_str
         })
         if not has_premium(uid):
-            update_user(uid, downloads_today=get_user_field(uid, 'downloads_today') + 1)
+            current_total = get_user_field(uid, 'total_downloads') or 0
+            update_user(uid, total_downloads=current_total + 1)
         if should_send_ad(uid):
             await callback.message.answer(send_ad_text())
             reset_action_count(uid)
